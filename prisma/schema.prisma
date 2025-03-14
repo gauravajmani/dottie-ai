@@ -1,0 +1,79 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id
+  email         String    @unique
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  emailAccounts EmailAccount[]
+  tasks         Task[]
+  calls         Call[]
+  events        Event[]
+}
+
+model EmailAccount {
+  id            String    @id @default(cuid())
+  provider      String    // "gmail" or "outlook"
+  email         String
+  accessToken   String
+  refreshToken  String
+  userId        String
+  user          User      @relation(fields: [userId], references: [id])
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@unique([userId, email])
+}
+
+model Task {
+  id          String    @id @default(cuid())
+  title       String
+  description String?
+  dueDate     DateTime?
+  completed   Boolean   @default(false)
+  priority    Int       @default(0)
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+model Call {
+  id            String    @id @default(cuid())
+  phoneNumber   String
+  direction     String    // "incoming" or "outgoing"
+  status        String    // "scheduled", "completed", "missed"
+  scheduledTime DateTime?
+  duration      Int?      // in seconds
+  recordingUrl  String?
+  transcription String?
+  userId        String
+  user          User      @relation(fields: [userId], references: [id])
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model Event {
+  id          String    @id @default(cuid())
+  title       String
+  description String?
+  startTime   DateTime
+  endTime     DateTime
+  location    String?
+  isRecurring Boolean   @default(false)
+  recurrence  Json?     // Store recurrence rules as JSON
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
