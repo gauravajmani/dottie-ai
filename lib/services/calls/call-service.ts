@@ -1,172 +1,343 @@
-import { prisma } from '../../db';
-import { CallOptions, ScheduledCallOptions, CallProvider } from './types';
 import { TwilioCallProvider } from './twilio-provider';
 import { VAPICallProvider } from './vapi-provider';
+import {
+  CallOptions,
+  CallProvider,
+  CallStatus,
+  ScheduledCallOptions,
+  ConferenceOptions,
+  Conference,
+  CallAnalytics,
+} from './types';
+import { prisma } from '@/lib/prisma';
+import { addMinutes, isBefore } from 'date-fns';
+import { zonedTimeToUtc } from 'date-fns-tz';
 
 export class CallService {
+  private provider: CallProvider;
   private userId: string;
-  private twilioProvider: TwilioCallProvider;
-  private vapiProvider: VAPICallProvider;
-  private defaultProvider: 'twilio' | 'vapi';
 
-  constructor(userId: string, defaultProvider: 'twilio' | 'vapi' = 'twilio') {
+  constructor(userId: string, providerType: 'twilio' | 'vapi' = 'twilio') {
     this.userId = userId;
-    this.twilioProvider = new TwilioCallProvider();
-    this.vapiProvider = new VAPICallProvider();
-    this.defaultProvider = defaultProvider;
+    this.provider = this.createProvider(providerType);
   }
 
-  private getProvider(provider?: 'twilio' | 'vapi'): CallProvider {
-    const selectedProvider = provider || this.defaultProvider;
-    return selectedProvider === 'twilio' ? this.twilioProvider : this.vapiProvider;
+  private createProvider(type: 'twilio' | 'vapi'): CallProvider {
+    switch (type) {
+      case 'twilio':
+        return new TwilioCallProvider();
+      case 'vapi':
+        return new VAPICallProvider();
+      default:
+        throw new Error('Invalid provider');
+    }
   }
 
-  async makeCall(options: CallOptions) {
-    const provider = this.getProvider(options.provider);
+  async makeCall(options: CallOptions): Promise<string> {
     try {
-      const callId = await provider.makeCall(options);
-
-      return await prisma.call.create({
-        data: {
-          id: callId,
-          phoneNumber: options.to,
-          direction: 'outgoing',
-          status: 'initiated',
-          userId: this.userId,
-        },
-      });
+      const callId = await this.provider.makeCall(options);
+      await this.saveCall(callId, options);
+      return callId;
     } catch (error) {
       console.error('Error making call:', error);
       throw error;
     }
   }
 
-  async scheduleCall(options: ScheduledCallOptions) {
-    // Store the scheduled call in the database
-    const scheduledCall = await prisma.call.create({
-      data: {
-        phoneNumber: options.to,
-        direction: 'outgoing',
-        status: 'scheduled',
-        scheduledTime: options.scheduledTime,
-        userId: this.userId,
-      },
-    });
-
-    // In a production environment, you would use a job queue system
-    // like Bull to schedule the actual call at the specified time
-    return scheduledCall;
-  }
-
-  async handleIncomingCall(callId: string, from: string, provider: 'twilio' | 'vapi') {
-    const selectedProvider = this.getProvider(provider);
+  async scheduleCall(options: ScheduledCallOptions): Promise<string> {
     try {
-      await selectedProvider.handleIncomingCall(callId, from);
+      if (!this.provider.scheduleCall) {
+        throw new Error('Provider does not support call scheduling');
+      }
 
-      return await prisma.call.create({
+      const utcScheduledTime = zonedTimeToUtc(options.scheduledTime, options.timezone);
+      
+      if (isBefore(utcScheduledTime, new Date())) {
+        throw new Error('Cannot schedule call in the past');
+      }
+
+      const callId = await this.provider.scheduleCall(options);
+      
+      await prisma.scheduledCall.create({
         data: {
           id: callId,
-          phoneNumber: from,
-          direction: 'incoming',
-          status: 'in-progress',
           userId: this.userId,
+          to: options.to,
+          from: options.from,
+          scheduledTime: utcScheduledTime,
+          timezone: options.timezone,
+          recurrence: options.recurrence,
+          reminder: options.reminder,
+          provider: options.provider || 'twilio',
+          status: 'scheduled',
+        },
+      });
+
+      if (options.reminder?.enabled) {
+        await this.scheduleReminder(callId, options);
+      }
+
+      return callId;
+    } catch (error) {
+      console.error('Error scheduling call:', error);
+      throw error;
+    }
+  }
+
+  private async scheduleReminder(callId: string, options: ScheduledCallOptions): Promise<void> {
+    if (!options.reminder?.enabled) return;
+
+    const reminderTime = addMinutes(
+      options.scheduledTime,
+      -options.reminder.minutesBefore
+    );
+
+    await prisma.reminder.create({
+      data: {
+        scheduledCallId: callId,
+        scheduledTime: reminderTime,
+        method: options.reminder.method,
+        status: 'pending',
+      },
+    });
+  }
+
+  async createConference(options: ConferenceOptions): Promise<string> {
+    try {
+      if (!this.provider.createConference) {
+        throw new Error('Provider does not support conference calls');
+      }
+
+      const conferenceId = await this.provider.createConference(options);
+      
+      await prisma.conference.create({
+        data: {
+          id: conferenceId,
+          userId: this.userId,
+          name: options.name,
+          status: 'scheduled',
+          provider: options.provider || 'twilio',
+          participants: {
+            create: options.participants.map(phoneNumber => ({
+              phoneNumber,
+              status: 'invited',
+              muted: options.muteOnEntry || false,
+            })),
+          },
+          maxParticipants: options.maxParticipants,
+          recordingEnabled: options.recordingEnabled,
+          transcriptionEnabled: options.transcriptionEnabled,
+          waitingRoom: options.waitingRoom,
+          muteOnEntry: options.muteOnEntry,
+        },
+      });
+
+      // Start inviting participants
+      for (const participant of options.participants) {
+        await this.provider.addParticipantToConference!(conferenceId, participant);
+      }
+
+      return conferenceId;
+    } catch (error) {
+      console.error('Error creating conference:', error);
+      throw error;
+    }
+  }
+
+  async addParticipantToConference(conferenceId: string, participant: string): Promise<void> {
+    try {
+      if (!this.provider.addParticipantToConference) {
+        throw new Error('Provider does not support conference calls');
+      }
+
+      const participantId = await this.provider.addParticipantToConference(
+        conferenceId,
+        participant
+      );
+
+      await prisma.conferenceParticipant.create({
+        data: {
+          id: participantId,
+          conferenceId,
+          phoneNumber: participant,
+          status: 'invited',
+          muted: false,
         },
       });
     } catch (error) {
-      console.error('Error handling incoming call:', error);
+      console.error('Error adding participant to conference:', error);
       throw error;
     }
   }
 
-  async updateCallStatus(callId: string, status: string, provider: 'twilio' | 'vapi') {
-    const selectedProvider = this.getProvider(provider);
+  async removeParticipantFromConference(conferenceId: string, participantId: string): Promise<void> {
     try {
-      await selectedProvider.updateCallStatus(callId, status);
+      if (!this.provider.removeParticipantFromConference) {
+        throw new Error('Provider does not support conference calls');
+      }
 
-      return await prisma.call.update({
-        where: { id: callId },
-        data: { status },
+      await this.provider.removeParticipantFromConference(conferenceId, participantId);
+      
+      await prisma.conferenceParticipant.update({
+        where: { id: participantId },
+        data: {
+          status: 'disconnected',
+          leftAt: new Date(),
+        },
       });
     } catch (error) {
-      console.error('Error updating call status:', error);
+      console.error('Error removing participant from conference:', error);
       throw error;
     }
   }
 
-  async handleRecording(callId: string, recordingUrl: string, provider: 'twilio' | 'vapi') {
-    const selectedProvider = this.getProvider(provider);
+  async muteParticipant(conferenceId: string, participantId: string, mute: boolean): Promise<void> {
     try {
-      await selectedProvider.handleRecording(callId, recordingUrl);
+      if (!this.provider.muteParticipant) {
+        throw new Error('Provider does not support conference calls');
+      }
 
-      return await prisma.call.update({
-        where: { id: callId },
-        data: { recordingUrl },
+      await this.provider.muteParticipant(conferenceId, participantId, mute);
+      
+      await prisma.conferenceParticipant.update({
+        where: { id: participantId },
+        data: { muted: mute },
       });
     } catch (error) {
-      console.error('Error handling recording:', error);
+      console.error('Error muting participant:', error);
       throw error;
     }
   }
 
-  async handleTranscription(callId: string, transcription: string, provider: 'twilio' | 'vapi') {
-    const selectedProvider = this.getProvider(provider);
+  async endConference(conferenceId: string): Promise<void> {
     try {
-      await selectedProvider.handleTranscription(callId, transcription);
+      if (!this.provider.endConference) {
+        throw new Error('Provider does not support conference calls');
+      }
 
-      return await prisma.call.update({
-        where: { id: callId },
-        data: { transcription },
+      await this.provider.endConference(conferenceId);
+      
+      await prisma.conference.update({
+        where: { id: conferenceId },
+        data: {
+          status: 'completed',
+          endTime: new Date(),
+        },
       });
     } catch (error) {
-      console.error('Error handling transcription:', error);
+      console.error('Error ending conference:', error);
       throw error;
     }
   }
 
-  generateCallResponse(options: {
-    message?: string;
-    recordingEnabled?: boolean;
-    transcriptionEnabled?: boolean;
-    gatherInput?: boolean;
-    provider: 'twilio' | 'vapi';
-  }) {
-    const selectedProvider = this.getProvider(options.provider);
-    return selectedProvider.generateCallResponse(options);
+  async handleIncomingCall(callId: string, from: string): Promise<any> {
+    return this.provider.handleIncomingCall(callId, from);
   }
 
-  async listCalls(options: {
-    status?: string;
-    direction?: 'incoming' | 'outgoing';
+  async updateCallStatus(callId: string, status: CallStatus): Promise<void> {
+    await this.provider.updateCallStatus(callId, status);
+    await this.updateCallRecord(callId, { status });
+  }
+
+  async handleRecording(callId: string, recordingUrl: string): Promise<void> {
+    await this.provider.handleRecording(callId, recordingUrl);
+    await this.updateCallRecord(callId, { recordingUrl });
+  }
+
+  async handleTranscription(callId: string, transcription: string): Promise<void> {
+    await this.provider.handleTranscription(callId, transcription);
+    await this.updateCallRecord(callId, { transcription });
+  }
+
+  async getCallAnalytics(callId: string): Promise<CallAnalytics | null> {
+    if (!this.provider.getCallAnalytics) {
+      return null;
+    }
+
+    try {
+      const analytics = await this.provider.getCallAnalytics(callId);
+      await this.updateCallRecord(callId, { analytics });
+      return analytics;
+    } catch (error) {
+      console.error('Error getting call analytics:', error);
+      return null;
+    }
+  }
+
+  private async saveCall(callId: string, options: CallOptions): Promise<void> {
+    await prisma.call.create({
+      data: {
+        id: callId,
+        userId: this.userId,
+        to: options.to,
+        from: options.from,
+        provider: options.provider || 'twilio',
+        recordingEnabled: options.recordingEnabled,
+        transcriptionEnabled: options.transcriptionEnabled,
+        status: 'queued',
+      },
+    });
+  }
+
+  private async updateCallRecord(callId: string, data: any): Promise<void> {
+    await prisma.call.update({
+      where: { id: callId },
+      data,
+    });
+  }
+
+  async listCalls(options?: {
+    status?: CallStatus;
+    from?: string;
+    to?: string;
     startDate?: Date;
     endDate?: Date;
-    provider?: 'twilio' | 'vapi';
-  } = {}) {
+    limit?: number;
+    offset?: number;
+  }): Promise<any[]> {
     return prisma.call.findMany({
       where: {
         userId: this.userId,
-        status: options.status,
-        direction: options.direction,
-        createdAt: {
-          gte: options.startDate,
-          lte: options.endDate,
-        },
+        ...(options?.status && { status: options.status }),
+        ...(options?.from && { from: options.from }),
+        ...(options?.to && { to: options.to }),
+        ...(options?.startDate && options?.endDate && {
+          createdAt: {
+            gte: options.startDate,
+            lte: options.endDate,
+          },
+        }),
       },
-      orderBy: {
-        createdAt: 'desc',
-      },
+      take: options?.limit || 50,
+      skip: options?.offset || 0,
+      orderBy: { createdAt: 'desc' },
     });
   }
 
-  // Provider-specific methods
-  async getVAPICallAnalytics(callId: string) {
-    return this.vapiProvider.getCallAnalytics(callId);
-  }
-
-  async updateVAPIAssistantConfig(callId: string, config: {
-    voice?: string;
-    language?: string;
-    message?: string;
-  }) {
-    return this.vapiProvider.updateAssistantConfig(callId, config);
+  async listConferences(options?: {
+    status?: 'scheduled' | 'in-progress' | 'completed';
+    startDate?: Date;
+    endDate?: Date;
+    limit?: number;
+    offset?: number;
+  }): Promise<Conference[]> {
+    return prisma.conference.findMany({
+      where: {
+        userId: this.userId,
+        ...(options?.status && { status: options.status }),
+        ...(options?.startDate && options?.endDate && {
+          startTime: {
+            gte: options.startDate,
+            lte: options.endDate,
+          },
+        }),
+      },
+      include: {
+        participants: true,
+      },
+      take: options?.limit || 50,
+      skip: options?.offset || 0,
+      orderBy: { startTime: 'desc' },
+    });
   }
 }
