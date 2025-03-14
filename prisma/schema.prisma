@@ -10,70 +10,86 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
 model User {
-  id            String    @id
-  email         String    @unique
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
-  emailAccounts EmailAccount[]
-  tasks         Task[]
-  calls         Call[]
-  events        Event[]
-}
-
-model EmailAccount {
   id            String    @id @default(cuid())
-  provider      String    // "gmail" or "outlook"
-  email         String
-  accessToken   String
-  refreshToken  String
-  userId        String
-  user          User      @relation(fields: [userId], references: [id])
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
-
-  @@unique([userId, email])
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+  accounts      Account[]
+  sessions      Session[]
+  calls         Call[]
+  callAnalyses  CallAnalysis[]
 }
 
-model Task {
-  id          String    @id @default(cuid())
-  title       String
-  description String?
-  dueDate     DateTime?
-  completed   Boolean   @default(false)
-  priority    Int       @default(0)
-  userId      String
-  user        User      @relation(fields: [userId], references: [id])
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
 }
 
 model Call {
   id            String    @id @default(cuid())
-  phoneNumber   String
-  direction     String    // "incoming" or "outgoing"
-  status        String    // "scheduled", "completed", "missed"
-  scheduledTime DateTime?
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider      String    // "twilio" or "vapi"
+  providerId    String    // Provider's call ID
+  from          String
+  to            String
+  status        String
   duration      Int?      // in seconds
   recordingUrl  String?
-  transcription String?
-  userId        String
-  user          User      @relation(fields: [userId], references: [id])
+  transcription String?   @db.Text
+  metadata      Json?
+  scheduledFor  DateTime?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
+  analyses      CallAnalysis[]
+
+  @@index([userId])
+  @@index([provider, providerId])
 }
 
-model Event {
-  id          String    @id @default(cuid())
-  title       String
-  description String?
-  startTime   DateTime
-  endTime     DateTime
-  location    String?
-  isRecurring Boolean   @default(false)
-  recurrence  Json?     // Store recurrence rules as JSON
-  userId      String
-  user        User      @relation(fields: [userId], references: [id])
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+model CallAnalysis {
+  id        String   @id @default(cuid())
+  callId    String
+  call      Call     @relation(fields: [callId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  analysis  Json     // Stores the VoiceAnalysis object
+  insights  String?  @db.Text
+  createdAt DateTime @default(now())
+
+  @@index([callId])
+  @@index([userId])
+  @@index([createdAt])
 }
